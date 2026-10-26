@@ -1,0 +1,2 @@
+DROP VIEW IF EXISTS daily_usage;
+DROP TABLE IF EXISTS requests;
