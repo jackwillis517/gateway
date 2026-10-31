@@ -4,20 +4,30 @@ import (
 	"context"
 	"database/sql"
 	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"gateway.jackwillis517.net/internal/data"
 	"gateway.jackwillis517.net/internal/jsonlog"
+	"gateway.jackwillis517.net/internal/provider"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
-const version = "1.0.0"
+var version = "1.0.0"
 
 type config struct {
-	port int
-	env  string
-	db   struct {
+	port            int
+	env             string
+	version         string
+	upstreamTimeout int
+	db              struct {
 		dsn          string
 		maxOpenConns int
 		maxIdleConns int
@@ -31,16 +41,25 @@ type config struct {
 }
 
 type application struct {
-	config config
-	logger *jsonlog.Logger
-	wg     sync.WaitGroup
+	config    config
+	logger    *jsonlog.Logger
+	models    data.Models
+	providers map[string]provider.Provider
+	wg        sync.WaitGroup
 }
 
 func main() {
-	var cfg config
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("No .env file found, relying on system environment variables")
+	}
 
-	flag.IntVar(&cfg.port, "port", 4000, "API server port")
+	var cfg config
+	cfg.version = version
+
+	flag.IntVar(&cfg.port, "port", 4005, "API server port")
 	flag.StringVar(&cfg.env, "env", "development", "Environment (development|staging|production)")
+	flag.IntVar(&cfg.upstreamTimeout, "upstream-timeout", 120, "max time (sec) for one providers call")
 	flag.StringVar(&cfg.db.dsn, "db-dsn", os.Getenv("GATEWAY_DB_DSN"), "PostgreSQL DSN")
 
 	flag.IntVar(&cfg.db.maxOpenConns, "db-max-open-conns", 25, "PostgreSQL max open connections")
@@ -51,9 +70,21 @@ func main() {
 	flag.IntVar(&cfg.limiter.burst, "limiter-burst", 4, "Rate limiter maximum burst")
 	flag.BoolVar(&cfg.limiter.enabled, "limiter-enabled", true, "Enable rate limiter")
 
+	healthcheck := flag.Bool("healthcheck", false, "Run a health check against the API server and exit")
+
 	flag.Parse()
 
 	logger := jsonlog.New(os.Stdout, jsonlog.LevelInfo)
+
+	// Run the health check before opening the database, so the container probe
+	// stays green while the database is down or still starting.
+	if *healthcheck {
+		if err := probeHealthcheck(cfg.port); err != nil {
+			logger.PrintFatal(err, nil)
+		}
+		logger.PrintInfo("healthcheck passed", nil)
+		os.Exit(0)
+	}
 
 	db, err := openDB(cfg)
 	if err != nil {
@@ -64,14 +95,38 @@ func main() {
 	logger.PrintInfo("database connection pool established", nil)
 
 	app := &application{
-		config: cfg,
-		logger: logger,
+		config:    cfg,
+		logger:    logger,
+		models:    data.NewModels(db),
+		providers: buildProviders(logger),
 	}
 
 	err = app.serve()
 	if err != nil {
 		logger.PrintFatal(err, nil)
 	}
+}
+
+func probeHealthcheck(port int) error {
+	client := http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Get(fmt.Sprintf("http://localhost:%d/v1/healthcheck", port))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthcheck returned status %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "status: available") {
+		return fmt.Errorf("unexpected healthcheck response: %q", string(body))
+	}
+	return nil
 }
 
 func openDB(cfg config) (*sql.DB, error) {
@@ -89,4 +144,24 @@ func openDB(cfg config) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func buildProviders(logger *jsonlog.Logger) map[string]provider.Provider {
+	providers := make(map[string]provider.Provider)
+	fmt.Println(os.Getenv("OLLAMA_BASE_URL"))
+
+	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+		providers["openai"] = provider.NewOpenAI(key)
+	}
+	if url := os.Getenv("OLLAMA_BASE_URL"); url != "" {
+		providers["ollama"] = provider.NewOllama(url)
+	}
+
+	if len(providers) == 0 {
+		logger.PrintInfo("no providers configured; set OPENAI_API_KEY and/or OLLAMA_BASE_URL", map[string]string{})
+	}
+	for name := range providers {
+		logger.PrintInfo("provider enabled", map[string]string{"provider": name})
+	}
+	return providers
 }

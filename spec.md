@@ -1,6 +1,6 @@
 ## Overview and scope
 
-The gateway is a single-user, OpenAI-compatible Go API that proxies `/v1/chat/completions` to Anthropic (then OpenAI and Ollama), authenticates every call with an API key, rate-limits per key with `golang.org/x/time/rate`, and writes one usage row per request to Postgres for Grafana.
+The gateway is a single-user, OpenAI-compatible Go API that proxies `/v1/chat/completions` to OpenAI and Ollama (both OpenAI-compatible, so one client serves both), authenticates every call with an API key, rate-limits per key with `golang.org/x/time/rate`, and writes one usage row per request to Postgres for Grafana.
 
 **Assumptions**
 
@@ -37,7 +37,7 @@ gateway/
 │ └── context.go contextSetUser / contextGetUser / contextGetAPIKey
 ├── cmd/keygen/ CLI: create an API key for the seeded user, print it once
 ├── internal/data/ models.go, users.go, api_keys.go, llm_models.go, requests.go
-├── internal/provider/ provider.go (interface), anthropic.go, openai.go, ollama.go, types.go
+├── internal/provider/ provider.go (interface), openai.go, ollama.go, types.go
 ├── internal/validator/ copied from LGF
 ├── internal/vcs/ build version (LGF Ch. 20)
 ├── migrations/
@@ -66,7 +66,7 @@ Let's Go Further runs `rateLimit` before `authenticate` because it limits by IP.
 | `-upstream-timeout`                                               | 120s              | Max time for one provider call                              |
 | `-version`                                                        | false             | Print version and exit                                      |
 
-Provider keys come only from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_BASE_URL`), never flags, so they do not show in process lists. On Cloud Run they come from Secret Manager (Nov 6).
+Provider keys come only from environment variables (`OPENAI_API_KEY`, `OLLAMA_BASE_URL`), never flags, so they do not show in process lists. On Cloud Run they come from Secret Manager (Nov 6).
 
 ## Endpoints and request shapes
 
@@ -85,7 +85,7 @@ Provider keys come only from environment variables (`ANTHROPIC_API_KEY`, `OPENAI
 
 ```json
 {
-  "model": "anthropic/<model-id>",
+  "model": "openai/<model-id>",
   "messages": [
     { "role": "system", "content": "You are terse." },
     { "role": "user", "content": "Explain SSE in one sentence." }
@@ -106,8 +106,8 @@ Provider keys come only from environment variables (`ANTHROPIC_API_KEY`, `OPENAI
 
 - `model` required, `messages` required with 1 to 500 items.
 - `role` in system, user, assistant. `content` is a non-empty string (content arrays are out of scope; reject with 400).
-- `max_tokens` 1 to the model's `max_output_tokens`; default 1024 when absent, because Anthropic requires it.
-- `temperature` 0 to 2 (clamped to 0 to 1 for Anthropic), `top_p` 0 to 1, `stop` up to 4 strings.
+- `max_tokens` 1 to the model's `max_output_tokens`; default 1024 when absent.
+- `temperature` 0 to 2, `top_p` 0 to 1, `stop` up to 4 strings.
 - `n` other than 1, `tools`, `functions`, `response_format` → 400 `unsupported_parameter`.
 
 **readJSON change from LGF:** keep `http.MaxBytesReader` (raise to 4 MB) and the detailed error mapping, but do **not** call `DisallowUnknownFields`. OpenAI clients send fields such as `presence_penalty` or `seed`; unknown fields are ignored instead of rejected.
@@ -119,7 +119,7 @@ Provider keys come only from environment variables (`ANTHROPIC_API_KEY`, `OPENAI
   "id": "chatcmpl-01JB...",
   "object": "chat.completion",
   "created": 1761256800,
-  "model": "anthropic/<model-id>",
+  "model": "openai/<model-id>",
   "choices": [
     {
       "index": 0,
@@ -141,7 +141,7 @@ Provider keys come only from environment variables (`ANTHROPIC_API_KEY`, `OPENAI
 Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`. Each chunk is one `data:` line followed by a blank line, flushed with `http.Flusher`:
 
 ```
-data: {"id":"chatcmpl-01JB...","object":"chat.completion.chunk","created":1761256800,"model":"anthropic/<model-id>","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"id":"chatcmpl-01JB...","object":"chat.completion.chunk","created":1761256800,"model":"openai/<model-id>","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-01JB...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"Server-Sent"},"finish_reason":null}]}
 
@@ -155,21 +155,6 @@ data: [DONE]
 The usage chunk is sent only when `stream_options.include_usage` is true, but the gateway always records usage either way.
 
 **Streaming gotcha:** LGF's `http.Server` has `WriteTimeout: 10s`, which cuts long streams. Keep it for other routes and extend it per request in the chat handler with `http.NewResponseController(w).SetWriteDeadline(time.Now().Add(app.config.upstreamTimeout))`. If the client disconnects (`r.Context().Done()`), cancel the upstream call and record the row with `status = 499`.
-
-### Anthropic translation
-
-|                           |                                                                                 |
-| ------------------------- | ------------------------------------------------------------------------------- |
-| OpenAI field              | Anthropic Messages API                                                          |
-| `system` role messages    | joined into top-level `system`                                                  |
-| `max_tokens`              | `max_tokens` (default 1024)                                                     |
-| `stop`                    | `stop_sequences`                                                                |
-| `usage.prompt_tokens`     | `usage.input_tokens` (+ cache read/write tokens)                                |
-| `usage.completion_tokens` | `usage.output_tokens`                                                           |
-| `finish_reason: stop`     | `stop_reason: end_turn` or `stop_sequence`                                      |
-| `finish_reason: length`   | `stop_reason: max_tokens`                                                       |
-| stream `delta.content`    | `content_block_delta` → `text_delta`                                            |
-| stream usage              | input tokens from `message_start`, output tokens from the final `message_delta` |
 
 ### Errors
 
@@ -375,9 +360,9 @@ Unlike LGF's `tokens` table, the hash is not the primary key: `requests` needs a
 ```sql
 CREATE TABLE IF NOT EXISTS models (
     id                         bigserial PRIMARY KEY,
-    name                       text NOT NULL UNIQUE,   -- 'anthropic/<model-id>'
+    name                       text NOT NULL UNIQUE,   -- 'openai/<model-id>' or 'ollama/<model-id>'
     alias                      text UNIQUE,            -- optional short name
-    provider                   text NOT NULL CHECK (provider IN ('anthropic', 'openai', 'ollama')),
+    provider                   text NOT NULL CHECK (provider IN ('openai', 'ollama')),
     upstream_model             text NOT NULL,          -- id sent to the provider
     input_price_per_mtok       numeric(12,6) NOT NULL DEFAULT 0,  -- USD per 1M tokens
     output_price_per_mtok      numeric(12,6) NOT NULL DEFAULT 0,
@@ -467,7 +452,7 @@ Every request that passes authentication writes exactly one `requests` row after
 \text{cost\_usd} = \frac{\text{input} \cdot p_{in} + \text{output} \cdot p_{out} + \text{cache\_read} \cdot p_{cr} + \text{cache\_write} \cdot p_{cw}}{1{,}000{,}000}
 ```
 
-Prices are USD per million tokens. Anthropic's `input_tokens` already excludes cache reads and writes, so the four counts add without double counting. A cache hit (Nov 11) never reaches the provider and costs 0.
+Prices are USD per million tokens. OpenAI and Ollama report `prompt_tokens`/`completion_tokens`; the cache read/write counts stay 0 until the Nov 11 response cache, so the four price terms add without double counting. A cache hit never reaches the provider and costs 0.
 
 ```go
 // internal/data/requests.go
@@ -610,6 +595,12 @@ Add a dashboard variable `model` (`SELECT DISTINCT model FROM requests WHERE mod
 ## Deployment, open questions and done criteria
 
 Cloud Run runs one practice instance of the gateway; Postgres and Grafana run outside it, because Cloud Run containers are stateless and scale to zero.
+
+**Container image (multi-stage Dockerfile)**
+
+- Two stages. Build stage on `golang:1.27-alpine`: copy `go.mod`, vendored deps (`make vendor` output) and source, then `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X gateway.jackwillis517.net/internal/vcs.Version=$VERSION" -o /api ./cmd/api` (LGF Ch. 20). `$VERSION` comes from `git describe --always --dirty` in a new `make build/image` target, so `-version`, `/v1/healthcheck` and `requests.gateway_version` all report the real build.
+- Runtime stage: `gcr.io/distroless/static-debian12:nonroot`, which already runs as UID 65532, ships CA certs for upstream TLS, and has no shell or package surface — so no `USER` directive is needed and the container is never root. If a debug shell is ever needed, the fallback is `alpine:3` + `USER appuser` (created with `adduser`); distroless stays the default for size and attack surface.
+- Cloud Run honours the image's non-root user; listening on `PORT` (default 4000) stays unprivileged.
 
 **Cloud Run settings**
 

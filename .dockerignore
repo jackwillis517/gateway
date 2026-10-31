@@ -1,0 +1,12 @@
+# VCS metadata and local creds never enter the build context.
+.git
+.envrc
+
+# Build output and non-Go files the image does not need.
+bin/
+plans/
+spec.md
+Makefile
+docker-compose.yml
+.dockerignore
+.markdownlint.json

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
+
+	"gateway.jackwillis517.net/internal/provider"
 )
 
 // apiError is the OpenAI error object: {"error": {message, type, param, code}}.
@@ -25,6 +29,30 @@ const (
 )
 
 func ptr(s string) *string { return &s }
+
+// ---------------------------------------------------------------------------
+// Upstream error classification
+// ---------------------------------------------------------------------------
+
+// classifyUpstreamError maps a provider error to the gateway's HTTP status,
+// OpenAI error type and code (see the spec's error table).
+func classifyUpstreamError(r *http.Request, err error) (status int, typ, code, msg string) {
+	var ue *provider.UpstreamError
+	switch {
+	case r.Context().Err() != nil:
+		// The client went away; the upstream call was cancelled with it.
+		return statusClientClosedRequest, "", "client_disconnected", ""
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout, "api_error", "upstream_timeout",
+			"the upstream provider did not respond in time"
+	case errors.As(err, &ue) && ue.Status == http.StatusTooManyRequests:
+		return http.StatusTooManyRequests, "rate_limit_error", "upstream_rate_limited",
+			"the upstream provider rate limited this request"
+	default:
+		return http.StatusBadGateway, "api_error", "upstream_error",
+			"the upstream provider returned an error"
+	}
+}
 
 func (app *application) logError(r *http.Request, err error) {
 	app.logger.PrintError(err, map[string]string{

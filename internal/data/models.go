@@ -14,6 +14,7 @@ type Models struct {
 	Users     UserModel
 	APIKey    APIKeyModel
 	LLMModels LLMModelModel
+	Request   RequestModel
 }
 
 func NewModels(db *sql.DB) Models {
@@ -21,5 +22,6 @@ func NewModels(db *sql.DB) Models {
 		Users:     UserModel{DB: db},
 		APIKey:    APIKeyModel{DB: db},
 		LLMModels: LLMModelModel{DB: db},
+		Request:   RequestModel{DB: db},
 	}
 }

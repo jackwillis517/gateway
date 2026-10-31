@@ -24,6 +24,26 @@ confirm:
 run/api:
 	go run ./cmd/api -db-dsn=${GATEWAY_DB_DSN}
 
+## build/api: build the cmd/api binary with the version injected
+.PHONY: build/api
+build/api:
+	go build -ldflags="-s -w -X main.version=$$(git rev-parse --short HEAD)" -o ./bin/api ./cmd/api
+
+## docker/build: build the gateway image with the current git sha as version
+.PHONY: docker/build
+docker/build:
+	docker build --build-arg VERSION=$$(git rev-parse --short HEAD) -t gateway:latest .
+
+## docker/up: build and start the gateway + postgres containers
+.PHONY: docker/up
+docker/up:
+	VERSION=$$(git rev-parse --short HEAD) docker compose up --build -d
+
+## docker/down: stop the gateway + postgres containers
+.PHONY: docker/down
+docker/down:
+	docker compose down
+
 ## db/psql: connect to the database using psql
 .PHONY: db/psql
 db/psql:

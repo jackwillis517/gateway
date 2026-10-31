@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: pa55word
+      POSTGRES_DB: gateway
+    ports:
+      - "5433:5432" # host 5433; 5432 already runs a local postgres
+    volumes:
+      - gateway-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # sslmode=disable: lib/pq defaults to sslmode=require, but the container
+      # DB has no TLS. Flags read this env var as the -db-dsn default.
+      GATEWAY_DB_DSN: postgres://gateway:pa55word@db:5432/gateway?sslmode=disable
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD", "/api", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  gateway-db:

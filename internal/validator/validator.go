@@ -2,6 +2,7 @@ package validator
 
 import (
 	"regexp"
+	"slices"
 )
 
 var EmailRX = regexp.MustCompile("^[a-zA-Z0-9.!#$%&'*+\\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
@@ -58,4 +59,9 @@ func Unique(values []string) bool {
 		uniqueValues[value] = true
 	}
 	return len(values) == len(uniqueValues)
+}
+
+// PermittedValue returns true if a specific value is in a list of permitted values.
+func PermittedValue[T comparable](value T, permittedValues ...T) bool {
+	return slices.Contains(permittedValues, value)
 }

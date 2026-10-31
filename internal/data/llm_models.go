@@ -63,7 +63,7 @@ func scanLLMModel(row interface{ Scan(...any) error }, m *LLMModel) error {
 }
 
 // GetByNameOrAlias looks up an enabled model by its full name
-// ("ollama/qwen3.5:2b-32k") or its alias ("qwen-local"). Returns
+// ("ollama/qwen3.5:4b") or its alias ("qwen-local"). Returns
 // ErrRecordNotFound for unknown or disabled models, which the handler turns
 // into 404 model_not_found.
 func (m LLMModelModel) GetByNameOrAlias(nameOrAlias string) (*LLMModel, error) {

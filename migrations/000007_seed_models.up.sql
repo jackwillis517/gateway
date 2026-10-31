@@ -6,7 +6,7 @@ INSERT INTO models (
 )
 VALUES
 (
-    'ollama/qwen3.5:2b-32k', 'qwen-local', 'ollama', 'qwen3.5:2b-32k',
+    'ollama/qwen3.5:4b', 'qwen-local', 'ollama', 'qwen3.5:4b',
     0, 0, 0, 0, 32768
 )
 ON CONFLICT (name) DO NOTHING;

@@ -22,7 +22,9 @@ type UserModel struct {
 
 var ErrDuplicateEmail = errors.New("duplicate email")
 
-var AnonymousUser = &User{}
+var AnonymousUser = &User{
+	ID: 1,
+}
 
 func (u *User) IsAnonymous() bool {
 	return u == AnonymousUser
