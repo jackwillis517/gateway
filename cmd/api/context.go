@@ -11,8 +11,8 @@ import (
 type contextKey string
 
 const (
-	userContextKey   = contextKey("user")
-	apiKeyContextKey = contextKey("api_key")
+	userContextKey  = contextKey("user")
+	tokenContextKey = contextKey("token")
 )
 
 func (app *application) contextSetUser(r *http.Request, user *data.User) *http.Request {
@@ -20,29 +20,27 @@ func (app *application) contextSetUser(r *http.Request, user *data.User) *http.R
 	return r.WithContext(ctx)
 }
 
-// contextGetUser returns the user set by the authenticate middleware. That
-// middleware is still stubbed, so for now requests carry no user: fall
-// back to the anonymous user instead of panicking, and the usage row
-// records its (zero) id. The real middleware will always set a user
-// (data.AnonymousUser when no key is sent), making this the LGF behavior
-// again.
+// contextGetUser returns the user set by the authenticate middleware, which
+// runs on every request and always sets one (data.AnonymousUser when no
+// Authorization header is sent). A missing user is therefore a programming
+// error — recoverPanic converts the panic to a 500.
 func (app *application) contextGetUser(r *http.Request) *data.User {
 	user, ok := r.Context().Value(userContextKey).(*data.User)
 	if !ok {
-		return data.AnonymousUser
+		panic("missing user in request context")
 	}
 	return user
 }
 
-func (app *application) contextSetAPIKey(r *http.Request, key *data.APIKey) *http.Request {
-	ctx := context.WithValue(r.Context(), apiKeyContextKey, key)
+func (app *application) contextSetToken(r *http.Request, token *data.Token) *http.Request {
+	ctx := context.WithValue(r.Context(), tokenContextKey, token)
 	return r.WithContext(ctx)
 }
 
-// contextGetAPIKey returns nil when the request is anonymous (for example
+// contextGetToken returns nil when the request is anonymous (for example
 // /v1/healthcheck). It does not panic, because callers such as rateLimit
-// legitimately see requests without a key.
-func (app *application) contextGetAPIKey(r *http.Request) *data.APIKey {
-	key, _ := r.Context().Value(apiKeyContextKey).(*data.APIKey)
-	return key
+// legitimately see requests without a token.
+func (app *application) contextGetToken(r *http.Request) *data.Token {
+	token, _ := r.Context().Value(tokenContextKey).(*data.Token)
+	return token
 }

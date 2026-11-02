@@ -1,11 +1,47 @@
 # curl commands for `POST /v1/chat/completions`
 
 The gateway listens on port `4005` by default (`-port` flag). The seeded model
-is `ollama/qwen3.5:2b-32k` (alias `qwen-local`), served by the `ollama`
+is `ollama/qwen3.5:4b` (alias `qwen-local`), served by the `ollama`
 provider, with a `max_output_tokens` ceiling of `32768`.
 
-Auth middleware is still stubbed, so no `Authorization` header is needed yet.
-Once it lands, add `-H "Authorization: Bearer $GATEWAY_KEY"` to every command.
+Mint a token first, then send it on every authenticated request:
+
+```sh
+GW_TOKEN=$(curl -s -X POST localhost:4005/v1/tokens/authentication \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"jackwillis517@gmail.com","password":"<seeded password>"}' \
+  | jq -r '.authentication_token.token')
+```
+
+Add `-H "Authorization: Bearer $GW_TOKEN"` to every command below. The token expires after 24h; mint a new one when it does. Keep the mint response around — the override test needs the token's `id`:
+
+```sh
+MINT=$(curl -s -X POST localhost:4005/v1/tokens/authentication \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"jackwillis517@gmail.com","password":"<seeded password>"}')
+GW_TOKEN=$(echo "$MINT" | jq -r '.authentication_token.token')
+GW_TOKEN_ID=$(echo "$MINT" | jq -r '.authentication_token.id')
+```
+
+## GET /v1/models
+
+OpenAI-compatible model list. `id` is the name clients send as `"model"`.
+
+### List models with a token
+
+```bash
+curl -s http://localhost:4005/v1/models \
+  -H "Authorization: Bearer $GW_TOKEN" | jq
+# expect: {"object": "list", "data": [
+#   {"id": "ollama/qwen3.5:4b", "object": "model", "created": <unix ts>, "owned_by": "ollama"}]}
+```
+
+### Without a token — 401
+
+```bash
+curl -si http://localhost:4005/v1/models | grep -E 'HTTP|code'
+# expect: HTTP/1.1 401 Unauthorized, "code": "missing_token"
+```
 
 ## Non-streaming
 
@@ -327,4 +363,111 @@ curl -s http://localhost:4005/v1/chat/completions \
   -H "Content-Type: application/json" \
   --data-binary @/tmp/big.json
 # expect: "body must not be larger than 1048576 bytes"
+```
+
+## Rate limiting
+
+Per-token, keyed by `tokens.id`. Defaults come from `-limiter-rps` (2) /
+`-limiter-burst` (4); a token row's `rate_limit_rps`/`rate_limit_burst`
+override them live (no restart). Anonymous requests are never limited.
+All commands need the `Authorization: Bearer $GW_TOKEN` header.
+
+### Burst exhaustion → 429 + headers
+
+Send more than the burst (4) faster than the refill (2/s):
+
+```bash
+for i in $(seq 1 6); do
+  curl -s -o /dev/null -w '%{http_code} ' \
+    -H "Authorization: Bearer $GW_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"qwen-local","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+    http://localhost:4005/v1/chat/completions
+done; echo
+# expect: mostly 200 then 429 (burst 4 + refill during the loop)
+```
+
+### The 429 response headers
+
+Immediately after exhausting the burst (run the loop above twice in a row):
+
+```bash
+curl -si -H "Authorization: Bearer $GW_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen-local","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  http://localhost:4005/v1/chat/completions \
+  | grep -iE '^HTTP|retry-after|x-ratelimit'
+# expect:
+#   HTTP/1.1 429 Too Many Requests
+#   Retry-After: 1
+#   X-RateLimit-Limit-Requests: 4
+#   X-RateLimit-Remaining-Requests: 0
+```
+
+### Refill — wait 1/rps, then it passes again
+
+```bash
+sleep 3    # rps 2 → ~6 tokens refilled
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $GW_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen-local","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  http://localhost:4005/v1/chat/completions
+# expect: 200
+```
+
+### Per-token isolation — one blocked, the other fine
+
+```bash
+GW_TOKEN2=$(curl -s -X POST localhost:4005/v1/tokens/authentication \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"jackwillis517@gmail.com","password":"<seeded password>"}' \
+  | jq -r '.authentication_token.token')
+# exhaust GW_TOKEN (loop above), then immediately:
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $GW_TOKEN2" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen-local","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  http://localhost:4005/v1/chat/completions
+# expect: 200 — each token has its own bucket
+```
+
+### Anonymous requests are never limited
+
+```bash
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w '%{http_code} ' http://localhost:4005/v1/healthcheck
+done; echo
+# expect: 200 ×10, no 429, no requests rows
+```
+
+### 429 rows land in `requests`
+
+```sh
+PGPASSWORD=pa55word psql -h 127.0.0.1 -U gateway -d gateway \
+  -c "SELECT request_id, status_code, error_code, model, input_tokens, output_tokens, cost_usd
+      FROM requests WHERE status_code = 429 ORDER BY id DESC LIMIT 3;"
+# expect: request_id 'chatcmpl-<ulid>', status_code 429, error_code rate_limit_exceeded,
+#         model NULL, 0 tokens, cost 0
+```
+
+### Per-token override without a restart
+
+```sh
+PGPASSWORD=pa55word psql -h 127.0.0.1 -U gateway -d gateway \
+  -c "UPDATE tokens SET rate_limit_rps = 10, rate_limit_burst = 20
+      WHERE id = $GW_TOKEN_ID;"
+# next request picks up the override (token row is re-read on every request):
+for i in $(seq 1 8); do
+  curl -s -o /dev/null -w '%{http_code} ' \
+    -H "Authorization: Bearer $GW_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"qwen-local","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+    http://localhost:4005/v1/chat/completions
+done; echo
+# expect: all 200 (burst 20 now) and X-RateLimit-Limit-Requests: 20 in the headers
+# reset afterwards:
+PGPASSWORD=pa55word psql -h 127.0.0.1 -U gateway -d gateway \
+  -c "UPDATE tokens SET rate_limit_rps = NULL, rate_limit_burst = NULL
+      WHERE id = $GW_TOKEN_ID;"
 ```

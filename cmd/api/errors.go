@@ -146,24 +146,33 @@ func (app *application) modelNotFoundResponse(w http.ResponseWriter, r *http.Req
 func (app *application) invalidAuthenticationTokenResponse(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	app.errorResponse(w, r, http.StatusUnauthorized, apiError{
-		Message: "invalid or missing API key",
+		Message: "invalid, revoked or expired token",
 		Type:    errAuthentication,
-		Code:    ptr("invalid_api_key"),
+		Code:    ptr("invalid_token"),
+	})
+}
+
+func (app *application) invalidCredentialsResponse(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	app.errorResponse(w, r, http.StatusUnauthorized, apiError{
+		Message: "invalid authentication credentials",
+		Type:    errAuthentication,
+		Code:    ptr("invalid_credentials"),
 	})
 }
 
 func (app *application) authenticationRequiredResponse(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	app.errorResponse(w, r, http.StatusUnauthorized, apiError{
-		Message: "you must provide an API key in the Authorization header",
+		Message: "you must provide a token in the Authorization header",
 		Type:    errAuthentication,
-		Code:    ptr("missing_api_key"),
+		Code:    ptr("missing_token"),
 	})
 }
 
 func (app *application) notPermittedResponse(w http.ResponseWriter, r *http.Request) {
 	app.errorResponse(w, r, http.StatusForbidden, apiError{
-		Message: "this API key does not have the required scope",
+		Message: "this token does not have the required scope",
 		Type:    errPermission,
 		Code:    ptr("insufficient_scope"),
 	})

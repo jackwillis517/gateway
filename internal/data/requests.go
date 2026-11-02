@@ -11,7 +11,7 @@ type Request struct {
 	RequestID         string // "chatcmpl-<ulid>", also the X-Request-Id header
 	CreatedAt         time.Time
 	UserID            int64
-	APIKeyID          *int64
+	TokenID           *int64
 	Model             *string // as requested; nil when rejected before parsing
 	Provider          *string
 	UpstreamModel     *string
@@ -44,7 +44,7 @@ type RequestModel struct {
 func (m RequestModel) Insert(ctx context.Context, r *Request) error {
 	query := `
 		INSERT INTO requests (
-			request_id, user_id, api_key_id, model, provider, upstream_model,
+			request_id, user_id, token_id, model, provider, upstream_model,
 			status_code, error_code, streamed, finish_reason,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 			latency_ms, upstream_latency_ms, ttft_ms,
@@ -71,7 +71,7 @@ func (m RequestModel) Insert(ctx context.Context, r *Request) error {
 	args := []any{
 		r.RequestID,
 		r.UserID,
-		r.APIKeyID,
+		r.TokenID,
 		r.Model,
 		r.Provider,
 		r.UpstreamModel,

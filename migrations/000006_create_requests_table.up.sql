@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS requests (
         (created_at AT TIME ZONE 'UTC')::date
     ) STORED,
     user_id bigint NOT NULL REFERENCES users,
-    api_key_id bigint REFERENCES api_keys ON DELETE SET NULL,
+    token_id bigint REFERENCES tokens ON DELETE SET NULL,   -- which token made the call
     -- as requested; NULL when rejected before parsing (429)
     model text,
     provider text,

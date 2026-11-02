@@ -57,7 +57,7 @@ func main() {
 	var cfg config
 	cfg.version = version
 
-	flag.IntVar(&cfg.port, "port", 4005, "API server port")
+	flag.IntVar(&cfg.port, "port", 4006, "API server port")
 	flag.StringVar(&cfg.env, "env", "development", "Environment (development|staging|production)")
 	flag.IntVar(&cfg.upstreamTimeout, "upstream-timeout", 120, "max time (sec) for one providers call")
 	flag.StringVar(&cfg.db.dsn, "db-dsn", os.Getenv("GATEWAY_DB_DSN"), "PostgreSQL DSN")

@@ -1,15 +1,15 @@
 ## Overview and scope
 
-The gateway is a single-user, OpenAI-compatible Go API that proxies `/v1/chat/completions` to OpenAI and Ollama (both OpenAI-compatible, so one client serves both), authenticates every call with an API key, rate-limits per key with `golang.org/x/time/rate`, and writes one usage row per request to Postgres for Grafana.
+The gateway is a single-user, OpenAI-compatible Go API that proxies `/v1/chat/completions` to OpenAI and Ollama (both OpenAI-compatible, so one client serves both), authenticates every call with a stateful authentication token, rate-limits per token with `golang.org/x/time/rate`, and writes one usage row per request to Postgres for Grafana.
 
 **Assumptions**
 
-- One user (me), seeded by a migration. There is no signup, password or login flow; I am treated as already authenticated and only need an API key.
-- Requests authenticate with `Authorization: Bearer <api key>` only.
+- One user (me), seeded by a migration with an email and a bcrypt password hash. There is no signup or activation flow; tokens are minted by `POST /v1/tokens/authorization` (email+password).
+- Requests authenticate with `Authorization: Bearer <token>` only.
 - Plain PostgreSQL, run and migrated the way Let's Go Further does it (`database/sql`, `lib/pq`, `golang-migrate`). This replaces the plan's "Cloud SQL or Neon" note for Oct 29.
 - Cloud Run deployment is for practice. It is not offered to other people, but nothing in the schema blocks adding users later.
 
-**In scope for W1:** chat completions (non-streaming and SSE streaming), API-key auth, per-key rate limits, usage and cost metering, a Grafana dashboard, deploy to Cloud Run.
+**In scope for W1:** chat completions (non-streaming and SSE streaming), token auth, per-token rate limits, usage and cost metering, a Grafana dashboard, deploy to Cloud Run.
 
 **Not in scope:** user signup, billing, tool/function calling passthrough, embeddings, image inputs, multiple choices (`n > 1`). Later W1 days add retries and fallback (Nov 4), response cache (Nov 11), `GET /v1/usage` (Nov 13) and key-management endpoints (Nov 18); the schema below already has the columns they need.
 
@@ -30,13 +30,13 @@ gateway/
 │ ├── chat.go createChatCompletionHandler (JSON + SSE)
 │ ├── llm_models.go listModelsHandler (GET /v1/models)
 │ ├── usage.go showUsageHandler (GET /v1/usage)
-│ ├── api_keys.go createAPIKeyHandler, revokeAPIKeyHandler (/v1/admin/api-keys)
+│ ├── tokens.go createTokenHandler, revokeTokenHandler (/v1/admin/tokens)
 │ ├── healthcheck.go healthcheckHandler
 │ ├── errors.go OpenAI-style error responses
 │ ├── helpers.go readJSON, writeJSON, background()
-│ └── context.go contextSetUser / contextGetUser / contextGetAPIKey
-├── cmd/keygen/ CLI: create an API key for the seeded user, print it once
-├── internal/data/ models.go, users.go, api_keys.go, llm_models.go, requests.go
+│ └── context.go contextSetUser / contextGetUser / contextSetToken / contextGetToken
+├── cmd/api/tokens.go createAuthenticationTokenHandler (POST /v1/tokens/authorization)
+├── internal/data/ models.go, users.go, tokens.go, llm_models.go, requests.go
 ├── internal/provider/ provider.go (interface), openai.go, ollama.go, types.go
 ├── internal/validator/ copied from LGF
 ├── internal/vcs/ build version (LGF Ch. 20)
@@ -50,7 +50,7 @@ jj
 return app.recoverPanic(app.authenticate(app.rateLimit(router)))
 ```
 
-Let's Go Further runs `rateLimit` before `authenticate` because it limits by IP. Here limits are per API key, so `authenticate` must run first. The chat route is also wrapped in `requireAuthenticatedUser`; `/v1/healthcheck` stays open.
+Let's Go Further runs `rateLimit` before `authenticate` because it limits by IP. Here limits are per token, so `authenticate` must run first. The chat route is also wrapped in `requireAuthenticatedUser`; `/v1/healthcheck` stays open.
 
 **Config (flags, LGF style)**
 
@@ -62,7 +62,7 @@ Let's Go Further runs `rateLimit` before `authenticate` because it limits by IP.
 | `-db-dsn`                                                         | `$GATEWAY_DB_DSN` | Postgres DSN                                                |
 | `-db-max-open-conns` / `-db-max-idle-conns` / `-db-max-idle-time` | 25 / 25 / 15m     | Pool settings from LGF                                      |
 | `-limiter-enabled`                                                | true              | Turn rate limiting off for local tests                      |
-| `-limiter-rps` / `-limiter-burst`                                 | 1 / 5             | Defaults when a key has no override                         |
+| `-limiter-rps` / `-limiter-burst`                                 | 1 / 5             | Defaults when a token has no override                     |
 | `-upstream-timeout`                                               | 120s              | Max time for one provider call                              |
 | `-version`                                                        | false             | Print version and exit                                      |
 
@@ -76,10 +76,11 @@ Provider keys come only from environment variables (`OPENAI_API_KEY`, `OLLAMA_BA
 | ------------- | ---------------------- | -------------------- | --------------------------------------- |
 | Method        | Path                   | Auth                 | Built on                                |
 | GET           | `/v1/healthcheck`      | none                 | Oct 24                                  |
-| POST          | `/v1/chat/completions` | API key              | Oct 28                                  |
-| GET           | `/v1/models`           | API key              | Oct 30 (lists enabled rows of `models`) |
-| GET           | `/v1/usage`            | API key              | Nov 13                                  |
-| POST / DELETE | `/v1/admin/api-keys`   | API key, admin scope | Nov 18                                  |
+| POST          | `/v1/tokens/authorization` | none (email+password) | W1                                       |
+| POST          | `/v1/chat/completions` | Token                | Oct 28                                  |
+| GET           | `/v1/models`           | Token                | Oct 30 (lists enabled rows of `models`) |
+| GET           | `/v1/usage`            | Token                | Nov 13                                  |
+| POST / DELETE | `/v1/admin/tokens`     | Token, admin scope   | Nov 18                                  |
 
 ### Request
 
@@ -175,66 +176,62 @@ Errors use the OpenAI envelope instead of LGF's `{"error": "..."}` so SDKs parse
 | ------ | ----------------------------------------- | --------------------------------------------------- |
 | Status | type                                      | When                                                |
 | 400    | invalid_request_error                     | bad JSON, failed validation, unsupported parameter  |
-| 401    | authentication_error                      | missing, malformed, unknown, revoked or expired key |
+| 401    | authentication_error                      | missing, malformed, unknown, revoked or expired token |
 | 404    | invalid_request_error (`model_not_found`) | unknown or disabled model                           |
-| 429    | rate_limit_error                          | per-key limiter denied the request                  |
+| 429    | rate_limit_error                          | per-token limiter denied the request                |
 | 502    | api_error (`upstream_error`)              | provider returned 5xx or bad data                   |
 | 504    | api_error (`upstream_timeout`)            | provider exceeded `-upstream-timeout`               |
 | 500    | api_error                                 | anything else (`serverErrorResponse`)               |
 
 A provider 429 is passed through as 429 with `code: upstream_rate_limited` so it is not confused with the gateway's own limit.
 
-## API key authentication
+## Token authentication
 
-API keys reuse LGF's stateful-token pattern (Ch. 15 to 16): a random plaintext shown once, only its SHA-256 hash stored, looked up on every request with a join to `users`.
+Auth is LGF's stateful authentication token (Ch. 15 to 16), the only credential: a random plaintext shown once, only its SHA-256 hash stored, looked up on every request with a join to `users`.
 
-**Key format:** `gw_` + base32 (no padding) of 32 bytes from `crypto/rand`, 55 characters in total. The `gw_` prefix makes keys easy to spot in logs and secret scanners. The first 10 characters are stored as `key_prefix` so keys can be told apart in Grafana and listings without exposing them.
+**Token format:** LGF's `generateToken` — a 26-character random string from `crypto/rand` (base62 alphabet). No prefix, no checksum: the SHA-256 hash is the only thing stored.
 
 ```go
-// internal/data/api_keys.go
-type APIKey struct {
-    Plaintext      string    `json:"key,omitempty"`  // only set at creation
+// internal/data/tokens.go
+type Token struct {
+    Plaintext      string    `json:"token,omitempty"`  // only set at creation
     Hash           []byte    `json:"-"`
     ID             int64     `json:"id"`
     UserID         int64     `json:"-"`
     Name           string    `json:"name"`
-    Prefix         string    `json:"prefix"`
     Scopes         []string  `json:"scopes"`
     RateLimitRPS   *float64  `json:"rate_limit_rps"`
     RateLimitBurst *int      `json:"rate_limit_burst"`
     ExpiresAt      *time.Time `json:"expires_at"`
 }
 
-func generateAPIKey(userID int64, name string, scopes []string) (*APIKey, error)
-func (m APIKeyModel) Insert(key *APIKey) error
-func (m APIKeyModel) GetForPlaintext(plaintext string) (*User, *APIKey, error)
-func (m APIKeyModel) Touch(id int64) error   // last_used_at, at most once a minute
-func (m APIKeyModel) Revoke(id, userID int64) error
+func generateToken(userID int64, name string, scopes []string) (*Token, error)
+func (m TokenModel) Insert(t *Token) error
+func (m TokenModel) GetForPlaintext(plaintext string) (*User, *Token, error)
+func (m TokenModel) Touch(id int64) error   // last_used_at, at most once a minute
+func (m TokenModel) Revoke(id, userID int64) error
 ```
 
 **authenticate middleware**
 
 1. Add `Vary: Authorization`.
-2. No `Authorization` header → `contextSetUser(r, data.AnonymousUser)` and continue (healthcheck works without a key).
-3. Header not `Bearer <key>`, or key fails the format check (prefix + length) → 401 with `WWW-Authenticate: Bearer`.
-4. `GetForPlaintext` hashes the key and runs one query: key matches, `revoked_at IS NULL`, `expires_at` null or in the future, user `activated`. Not found → 401 `invalid_api_key`.
-5. Put the user and the key in the request context (`contextSetUser`, `contextSetAPIKey`).
-6. Call `Touch` in `app.background()` only if `last_used_at` is older than a minute, so a busy key does not write on every request.
+2. No `Authorization` header → `contextSetUser(r, data.AnonymousUser)` and continue (healthcheck works without a token).
+3. Header not `Bearer <token>`, or token fails the format check (length) → 401 with `WWW-Authenticate: Bearer`.
+4. `GetForPlaintext` hashes the token and runs one query: hash matches, `revoked_at IS NULL`, `expires_at` null or in the future, user `activated`. Not found → 401 `invalid_token`.
+5. Put the user and the token in the request context (`contextSetUser`, `contextSetToken`).
+6. Call `Touch` in `app.background()` only if `last_used_at` is older than a minute, so a busy token does not write on every request.
 
 `requireAuthenticatedUser` wraps the chat, models and usage routes. `requireScope("admin", ...)` (LGF's `requirePermission`, renamed) guards the Nov 18 admin endpoints.
 
-**The single user:** a migration seeds one row in `users` (me). There is no signup, password or activation flow. Keys are created with a small CLI that talks to the database directly:
+**The single user:** a migration seeds one row in `users` (me) with a bcrypt password hash (cost 12). There is no signup or activation flow. Tokens are minted by exchanging email+password at `POST /v1/tokens/authorization` (LGF 9.3 `createAuthenticationTokenHandler`): a 201 returns `{"authentication_token": {"token": "<26 chars>", ...}}` with a 24-hour expiry. The plaintext is shown once; only its SHA-256 hash is stored.
 
-```
-go run ./cmd/keygen -db-dsn=$GATEWAY_DB_DSN -name=laptop -scopes=chat,admin
-# prints: gw_Q3K7... (shown once, store it in your password manager)
-```
+Testing: `curl -H "Authorization: Bearer $GW_TOKEN" localhost:4005/v1/chat/completions -d @req.json`, and the OpenAI Python SDK with `base_url="http://localhost:4005/v1"` (the SDK's `api_key` parameter carries the token; it is still sent as `Authorization: Bearer`).
 
-Testing: `curl -H "Authorization: Bearer $GW_KEY" localhost:4000/v1/chat/completions -d @req.json`, and the OpenAI Python SDK with `base_url="http://localhost:4000/v1"`.
+When `requireScope("chat"/"admin")` lands (Nov 18), revisit what `/v1/tokens/authorization` mints — today it stores `{"authentication"}` and no code checks scopes.
 
 ## Rate limiting
 
-Each API key gets its own `rate.Limiter` token bucket (default 1 request/second refill, burst 5), kept in an in-memory map exactly like LGF Ch. 11's per-IP limiter, but keyed by `api_keys.id`.
+Each token gets its own `rate.Limiter` bucket (default 1 request/second refill, burst 5), kept in an in-memory map exactly like LGF Ch. 11's per-IP limiter, but keyed by `tokens.id`.
 
 ```go
 // cmd/api/middleware.go
@@ -255,17 +252,17 @@ func (app *application) rateLimit(next http.Handler) http.Handler {
         if !app.config.limiter.enabled {
             next.ServeHTTP(w, r); return
         }
-        key := app.contextGetAPIKey(r)
-        if key == nil { // anonymous: only /v1/healthcheck reaches here
+        token := app.contextGetToken(r)
+        if token == nil { // anonymous: only /v1/healthcheck reaches here
             next.ServeHTTP(w, r); return
         }
-        rps, burst := app.limitsFor(key) // key override, else flag defaults
+        rps, burst := app.limitsFor(token) // token override, else flag defaults
 
         mu.Lock()
-        c, ok := clients[key.ID]
+        c, ok := clients[token.ID]
         if !ok {
             c = &client{limiter: rate.NewLimiter(rate.Limit(rps), burst)}
-            clients[key.ID] = c
+            clients[token.ID] = c
         }
         c.lastSeen = time.Now()
         if c.limiter.Limit() != rate.Limit(rps) { c.limiter.SetLimit(rate.Limit(rps)) }
@@ -291,17 +288,17 @@ func (app *application) rateLimit(next http.Handler) http.Handler {
 
 **Why `Reserve()` instead of LGF's `Allow()`:** `Allow()` only says yes or no. `Reserve().Delay()` also tells how long until a token is free, which fills the `Retry-After` header that OpenAI SDKs use for their own backoff. `Cancel()` returns the token so a rejected call does not cost one.
 
-**Limits come from the key row.** `api_keys.rate_limit_rps` and `rate_limit_burst` override the `-limiter-rps` / `-limiter-burst` flags when set. `SetLimit` / `SetBurst` apply a changed value without restarting the server.
+**Limits come from the token row.** `tokens.rate_limit_rps` and `rate_limit_burst` override the `-limiter-rps` / `-limiter-burst` flags when set. `SetLimit` / `SetBurst` apply a changed value without restarting the server.
 
 **Rejected calls are recorded.** A 429 writes a `requests` row with `status = 429`, zero tokens and zero cost, so Grafana can chart how often the limit fires.
 
 **Cloud Run caveat:** the map lives in one process. With several instances each enforces its own bucket, so the real limit becomes limit × instances. Deploy with `--max-instances=1` for W1; a shared limiter (Postgres or Redis) is only needed if other people ever use it.
 
-**Optional, if time allows: tokens per minute.** A second `rate.Limiter` per key with `rate.Limit(tpm/60)` and burst `tpm` (`api_keys.tokens_per_minute`). Before the call, reject if `limiter.Tokens() <= 0`; after the call, debit the real total with `limiter.ReserveN(time.Now(), min(total, tpm))`, which may push the bucket into debt and delay the next request. This caps spend, not just request count.
+**Optional, if time allows: tokens per minute.** A second `rate.Limiter` per token with `rate.Limit(tpm/60)` and burst `tpm` (`tokens.tokens_per_minute`). Before the call, reject if `limiter.Tokens() <= 0`; after the call, debit the real total with `limiter.ReserveN(time.Now(), min(total, tpm))`, which may push the bucket into debt and delay the next request. This caps spend, not just request count.
 
 ## Postgres schema
 
-Four tables: `users` (just me), `api_keys`, `models` (catalog and prices), and `requests` (one usage row per call). Migrations use `golang-migrate` with LGF's numbered up/down files.
+Four tables: `users` (just me), `tokens`, `models` (catalog and prices), and `requests` (one usage row per call). Migrations use `golang-migrate` with LGF's numbered up/down files.
 
 |                                  |                                         |
 | -------------------------------- | --------------------------------------- |
@@ -309,7 +306,7 @@ Four tables: `users` (just me), `api_keys`, `models` (catalog and prices), and `
 | `000001_create_citext_extension` | `citext` for case-insensitive email     |
 | `000002_create_users_table`      | `users`                                 |
 | `000003_seed_user`               | the single user row (me)                |
-| `000004_create_api_keys_table`   | `api_keys`                              |
+| `000004_create_tokens_table`     | `tokens`                                |
 | `000005_create_models_table`     | `models` + seed rows                    |
 | `000006_create_requests_table`   | `requests`, indexes, `daily_usage` view |
 
@@ -330,17 +327,16 @@ INSERT INTO users (name, email) VALUES ('Me', 'me@example.com')
 ON CONFLICT (email) DO NOTHING;
 ```
 
-No `password_hash` column: I am assumed authenticated, and API keys are the only credential.
+`password_hash bytea NOT NULL` (LGF `password` type, bcrypt cost 12, seeded by `000003`): tokens are minted by exchanging email+password, never without a credential check. Stateful tokens are the only credential.
 
-### api_keys
+### tokens
 
 ```sql
-CREATE TABLE IF NOT EXISTS api_keys (
+CREATE TABLE IF NOT EXISTS tokens (
     id                bigserial PRIMARY KEY,
     user_id           bigint NOT NULL REFERENCES users ON DELETE CASCADE,
     name              text NOT NULL,                 -- 'laptop', 'ci'
-    key_prefix        text NOT NULL,                 -- first 10 chars, for display
-    hash              bytea NOT NULL UNIQUE,         -- sha256(plaintext)
+    hashed_token      bytea NOT NULL UNIQUE,         -- sha256(plaintext)
     scopes            text[] NOT NULL DEFAULT '{chat}',
     rate_limit_rps    numeric(8,3) CHECK (rate_limit_rps > 0),     -- NULL = flag default
     rate_limit_burst  integer CHECK (rate_limit_burst > 0),
@@ -350,10 +346,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
     expires_at        timestamptz,                   -- NULL = never
     revoked_at        timestamptz                    -- NULL = active
 );
-CREATE INDEX IF NOT EXISTS api_keys_user_id_idx ON api_keys (user_id);
+CREATE INDEX IF NOT EXISTS tokens_user_id_idx ON tokens (user_id);
 ```
 
-Unlike LGF's `tokens` table, the hash is not the primary key: `requests` needs a small stable `id` to reference.
+Like LGF's `tokens` table, except the hash is not the primary key: `requests` needs a small stable `id` to reference.
 
 ### models
 
@@ -388,7 +384,7 @@ CREATE TABLE IF NOT EXISTS requests (
     created_at          timestamptz NOT NULL DEFAULT now(), -- request start, Grafana time column
     usage_date          date GENERATED ALWAYS AS ((created_at AT TIME ZONE 'UTC')::date) STORED,
     user_id             bigint NOT NULL REFERENCES users,
-    api_key_id          bigint REFERENCES api_keys ON DELETE SET NULL,
+    token_id          bigint REFERENCES tokens ON DELETE SET NULL,   -- which token made the call
     model               text,                -- as requested; NULL when rejected before parsing (429)
     provider            text,
     upstream_model      text,
@@ -441,7 +437,7 @@ CREATE ROLE grafana_ro LOGIN PASSWORD '<generate one>';
 GRANT CONNECT ON DATABASE gateway TO grafana_ro;
 GRANT USAGE ON SCHEMA public TO grafana_ro;
 GRANT SELECT ON requests, models, users, daily_usage TO grafana_ro;
-GRANT SELECT (id, user_id, name, key_prefix, created_at, last_used_at, revoked_at) ON api_keys TO grafana_ro;  -- never the hash
+GRANT SELECT (id, user_id, name, created_at, last_used_at, revoked_at) ON tokens TO grafana_ro;  -- never the hash
 ```
 
 ## Usage recording and cost
@@ -459,7 +455,7 @@ Prices are USD per million tokens. OpenAI and Ollama report `prompt_tokens`/`com
 type Request struct {
     RequestID         string
     UserID            int64
-    APIKeyID          *int64
+    TokenID           *int64
     Model, Provider, UpstreamModel, ErrorCode, FinishReason *string
     StatusCode        int
     Streamed          bool
@@ -479,7 +475,7 @@ func (m RequestModel) Insert(ctx context.Context, r *Request) error
 The insert computes cost from the matching `models` row in the same statement (numeric math in Postgres, no float rounding in Go):
 
 ```sql
-INSERT INTO requests (request_id, user_id, api_key_id, model, provider, upstream_model,
+INSERT INTO requests (request_id, user_id, token_id, model, provider, upstream_model,
     status_code, error_code, streamed, finish_reason,
     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
     latency_ms, upstream_latency_ms, ttft_ms, retry_count, fallback_used, cache_hit,
@@ -522,7 +518,7 @@ Grafana reads `requests` directly through its PostgreSQL data source as `grafana
 | 5   | Latency p50 / p95           | time series (ms)     | Is the gateway or provider getting slower?            |
 | 6   | Time to first token p95     | time series (ms)     | How fast do streams start?                            |
 | 7   | Error and 429 rate          | stat (%)             | Is anything broken right now?                         |
-| 8   | Usage by API key            | table                | Which key made which calls?                           |
+| 8   | Usage by token              | table                | Which token made which calls?                         |
 | 9   | By gateway version          | table                | Did a deploy change latency, errors or cost?          |
 | 10  | Cache hit and fallback rate | time series (%)      | Do Nov 4 and Nov 11 features pay off?                 |
 
@@ -567,12 +563,12 @@ SELECT 100.0 * count(*) FILTER (WHERE status_code >= 500) / nullif(count(*), 0) 
        100.0 * count(*) FILTER (WHERE status_code = 429)  / nullif(count(*), 0) AS limited_pct
 FROM requests WHERE $__timeFilter(created_at);
 
--- 8 Usage by API key
-SELECT k.name, k.key_prefix, count(*) AS requests,
+-- 8 Usage by token
+SELECT k.name, count(*) AS requests,
        sum(r.input_tokens) AS input_tokens, sum(r.output_tokens) AS output_tokens,
        sum(r.cost_usd) AS cost_usd, max(r.created_at) AS last_request
-FROM requests r JOIN api_keys k ON k.id = r.api_key_id
-WHERE $__timeFilter(r.created_at) GROUP BY k.name, k.key_prefix ORDER BY cost_usd DESC;
+FROM requests r JOIN tokens k ON k.id = r.token_id
+WHERE $__timeFilter(r.created_at) GROUP BY k.name ORDER BY cost_usd DESC;
 
 -- 9 By gateway version
 SELECT gateway_version, min(created_at) AS first_seen, count(*) AS requests,

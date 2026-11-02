@@ -1,9 +1,8 @@
-CREATE TABLE IF NOT EXISTS api_keys (
+CREATE TABLE IF NOT EXISTS tokens (
     id bigserial PRIMARY KEY,
     user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
-    name text NOT NULL,                 -- 'laptop', 'ci'
-    key_prefix text NOT NULL,                 -- first 10 chars, for display
-    hash bytea NOT NULL UNIQUE,         -- sha256(plaintext)
+    name text NOT NULL,                 -- 'laptop', 'authorization'
+    hashed_token bytea NOT NULL UNIQUE,  -- sha256(plaintext)
     scopes text[] NOT NULL DEFAULT '{chat}',
     -- NULL = flag default
     rate_limit_rps numeric(8, 3) CHECK (rate_limit_rps > 0),
@@ -15,4 +14,4 @@ CREATE TABLE IF NOT EXISTS api_keys (
     expires_at timestamptz,                   -- NULL = never
     revoked_at timestamptz                    -- NULL = active
 );
-CREATE INDEX IF NOT EXISTS api_keys_user_id_idx ON api_keys (user_id);
+CREATE INDEX IF NOT EXISTS tokens_user_id_idx ON tokens (user_id);

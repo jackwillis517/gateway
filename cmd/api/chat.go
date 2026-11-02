@@ -35,8 +35,8 @@ func (app *application) createChatCompletionHandler(w http.ResponseWriter, r *ht
 		GatewayVersion: app.config.version,
 		StatusCode:     http.StatusOK, // overwritten on every failure path
 	}
-	if key := app.contextGetAPIKey(r); key != nil {
-		rec.APIKeyID = &key.ID
+	if t := app.contextGetToken(r); t != nil {
+		rec.TokenID = &t.ID
 	}
 	defer func() {
 		rec.LatencyMs = int(time.Since(start).Milliseconds())
@@ -325,7 +325,7 @@ func (app *application) recordUsage(rec *data.Request) {
 			"status":              strconv.Itoa(rec.StatusCode),
 			"model":               strOrNull(rec.Model),
 			"provider":            strOrNull(rec.Provider),
-			"error_code":           strOrNull(rec.ErrorCode),
+			"error_code":          strOrNull(rec.ErrorCode),
 			"streamed":            strconv.FormatBool(rec.Streamed),
 			"finish_reason":       strOrNull(rec.FinishReason),
 			"input_tokens":        strconv.Itoa(rec.InputTokens),

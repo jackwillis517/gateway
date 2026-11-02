@@ -12,7 +12,7 @@ var (
 
 type Models struct {
 	Users     UserModel
-	APIKey    APIKeyModel
+	Tokens    TokenModel
 	LLMModels LLMModelModel
 	Request   RequestModel
 }
@@ -20,7 +20,7 @@ type Models struct {
 func NewModels(db *sql.DB) Models {
 	return Models{
 		Users:     UserModel{DB: db},
-		APIKey:    APIKeyModel{DB: db},
+		Tokens:    TokenModel{DB: db},
 		LLMModels: LLMModelModel{DB: db},
 		Request:   RequestModel{DB: db},
 	}
